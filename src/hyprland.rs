@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-const RESPONSE_BYTES_MAX: u64 = 1024 * 1024;
+const RESPONSE_SIZE_BYTES_MAX: u64 = 1024 * 1024;
 
 pub fn watch(sender: &SyncSender<std::result::Result<Snapshot, String>>) -> Result<()> {
     let directory =
@@ -21,7 +21,7 @@ pub fn watch(sender: &SyncSender<std::result::Result<Snapshot, String>>) -> Resu
     // Subscribe before reading state so a switch during initialization is not lost.
     let mut events = BufReader::new(UnixStream::connect(directory.join(".socket2.sock"))?);
     let mut urgent = [false; 32];
-    sender.send(Ok(snapshot(&directory, &mut urgent)?))?;
+    sender.send(Ok(read_snapshot(&directory, &mut urgent)?))?;
     loop {
         let mut line = Vec::new();
         let count = events.by_ref().take(4097).read_until(b'\n', &mut line)?;
@@ -36,7 +36,7 @@ pub fn watch(sender: &SyncSender<std::result::Result<Snapshot, String>>) -> Resu
             let address = line
                 .strip_prefix(b"urgent>>")
                 .ok_or("malformed urgent event")?;
-            if let Some(workspace) = urgent_workspace(&directory, address)? {
+            if let Some(workspace) = find_urgent_workspace(&directory, address)? {
                 urgent[(workspace - 1) as usize] = true;
             }
         }
@@ -54,7 +54,7 @@ pub fn watch(sender: &SyncSender<std::result::Result<Snapshot, String>>) -> Resu
                 | b"monitoraddedv2"
                 | b"monitorremoved"
         ) {
-            sender.send(Ok(snapshot(&directory, &mut urgent)?))?;
+            sender.send(Ok(read_snapshot(&directory, &mut urgent)?))?;
         }
     }
 }
@@ -83,9 +83,9 @@ fn query<T: serde::de::DeserializeOwned>(directory: &Path, command: &[u8]) -> Re
     socket.write_all(command)?;
     let mut bytes = Vec::new();
     socket
-        .take(RESPONSE_BYTES_MAX + 1)
+        .take(RESPONSE_SIZE_BYTES_MAX + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > RESPONSE_BYTES_MAX {
+    if bytes.len() as u64 > RESPONSE_SIZE_BYTES_MAX {
         return Err("Hyprland response exceeds 1 MiB".into());
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -97,7 +97,7 @@ struct Client {
     workspace: ActiveWorkspace,
 }
 
-fn urgent_workspace(directory: &Path, address: &[u8]) -> Result<Option<i32>> {
+fn find_urgent_workspace(directory: &Path, address: &[u8]) -> Result<Option<i32>> {
     let address = std::str::from_utf8(address)?.trim();
     let address = address.strip_prefix("0x").unwrap_or(address);
     if address.is_empty() {
@@ -122,7 +122,7 @@ fn urgent_workspace(directory: &Path, address: &[u8]) -> Result<Option<i32>> {
         .filter(|workspace| (1..=32).contains(workspace)))
 }
 
-fn snapshot(directory: &Path, urgent: &mut [bool; 32]) -> Result<Snapshot> {
+fn read_snapshot(directory: &Path, urgent: &mut [bool; 32]) -> Result<Snapshot> {
     let monitors: Vec<Monitor> = query(directory, b"j/monitors")?;
     let workspaces: Vec<Workspace> = query(directory, b"j/workspaces")?;
     let monitor = monitors

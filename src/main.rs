@@ -1,7 +1,7 @@
 mod hyprland;
 mod model;
 
-use model::{Config, Motion, Snapshot};
+use model::{Configuration, Motion, Snapshot};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
@@ -35,21 +35,21 @@ use wayland_client::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
-const POOL_BYTES: usize = 8 * 1024 * 1024;
+const BUFFER_POOL_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().collect();
     if arguments.len() != 2 {
         return Err("usage: workspace-indicator CONFIG.json".into());
     }
-    let config = Config::load(&arguments[1])?;
+    let configuration = Configuration::load(&arguments[1])?;
     let connection = Connection::connect_to_env()?;
     let (globals, queue) = registry_queue_init(&connection)?;
     let handle = queue.handle();
     let compositor = CompositorState::bind(&globals, &handle)?;
     let shell = LayerShell::bind(&globals, &handle)?;
     let shm = Shm::bind(&globals, &handle)?;
-    let pool = SlotPool::new(POOL_BYTES, &shm)?;
+    let pool = SlotPool::new(BUFFER_POOL_SIZE_BYTES, &shm)?;
     let mut app = App {
         registry: RegistryState::new(&globals),
         outputs: OutputState::new(&globals, &handle),
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         shell,
         shm,
         pool,
-        config,
+        configuration,
         snapshot: None,
         visible: None,
         epoch: Instant::now(),
@@ -73,22 +73,7 @@ fn main() -> Result<()> {
         .handle()
         .insert_source(receiver, move |event, _, app| match event {
             channel::Event::Msg(Ok(snapshot)) => {
-                let center = app.config.active_center(snapshot.active);
-                let now = app.epoch.elapsed();
-                match center {
-                    Some(center) => match &mut app.motion {
-                        Some(motion) => motion.retarget(center, now),
-                        None => {
-                            app.motion = Some(Motion::new(
-                                center,
-                                Duration::from_millis(app.config.animation_ms),
-                            ))
-                        }
-                    },
-                    None => app.motion = None,
-                }
-                app.snapshot = Some(snapshot);
-                app.refresh(&event_handle);
+                app.update_snapshot(snapshot, &event_handle);
             }
             channel::Event::Msg(Err(error)) => app.failure = Some(error),
             channel::Event::Closed => app.exit = true,
@@ -122,16 +107,16 @@ struct App {
     shell: LayerShell,
     shm: Shm,
     pool: SlotPool,
-    config: Config,
+    configuration: Configuration,
     snapshot: Option<Snapshot>,
-    visible: Option<Visible>,
+    visible: Option<IndicatorSurface>,
     epoch: Instant,
     motion: Option<Motion>,
     failure: Option<String>,
     exit: bool,
 }
 
-struct Visible {
+struct IndicatorSurface {
     layer: LayerSurface,
     output: wl_output::WlOutput,
     configured: bool,
@@ -142,6 +127,25 @@ struct Visible {
 }
 
 impl App {
+    fn update_snapshot(&mut self, snapshot: Snapshot, handle: &QueueHandle<Self>) {
+        let center = self.configuration.active_center(snapshot.active);
+        let now = self.epoch.elapsed();
+        match center {
+            Some(center) => match &mut self.motion {
+                Some(motion) => motion.retarget(center, now),
+                None => {
+                    self.motion = Some(Motion::new(
+                        center,
+                        Duration::from_millis(self.configuration.animation_ms),
+                    ));
+                }
+            },
+            None => self.motion = None,
+        }
+        self.snapshot = Some(snapshot);
+        self.refresh(handle);
+    }
+
     fn refresh(&mut self, handle: &QueueHandle<Self>) {
         if let Err(error) = self.refresh_surface(handle) {
             self.failure = Some(error.to_string());
@@ -190,13 +194,13 @@ impl App {
             Some(&output),
         );
         layer.set_anchor(Anchor::TOP);
-        layer.set_margin(self.config.margin_top, 0, 0, 0);
+        layer.set_margin(self.configuration.margin_top, 0, 0, 0);
         // Ignore Waybar's exclusive zone: the overlay shares its row, not the desktop below it.
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_size(self.config.width(), self.config.height);
+        layer.set_size(self.configuration.width(), self.configuration.height);
         layer.commit();
-        self.visible = Some(Visible {
+        self.visible = Some(IndicatorSurface {
             layer,
             output,
             configured: false,
@@ -221,8 +225,8 @@ impl App {
         if visible.frame_pending {
             return Ok(());
         }
-        let width = self.config.width() as i32 * visible.scale;
-        let height = self.config.height as i32 * visible.scale;
+        let width = self.configuration.width() as i32 * visible.scale;
+        let height = self.configuration.height as i32 * visible.scale;
         let index = visible
             .buffers
             .iter()
@@ -234,7 +238,7 @@ impl App {
                     self.pool
                         .create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)?;
                 // Fail rather than allow growth under pathological buffer-release delays.
-                if self.pool.len() > POOL_BYTES {
+                if self.pool.len() > BUFFER_POOL_SIZE_BYTES {
                     return Err("render buffer pool exhausted".into());
                 }
                 visible.buffers.push(buffer);
@@ -255,7 +259,7 @@ impl App {
             canvas,
             visible.scale as u32,
             self.motion.as_ref().map(|motion| motion.sample(now)),
-            &self.config,
+            &self.configuration,
             snapshot,
         );
         let surface = visible.layer.wl_surface();
@@ -398,11 +402,11 @@ impl LayerShellHandler for App {
             return;
         };
         let (width, height) = configure.new_size;
-        if width != 0 && width != self.config.width() {
+        if ![0, self.configuration.width()].contains(&width) {
             self.failure = Some("compositor rejected indicator width".into());
             return;
         }
-        if height != 0 && height != self.config.height {
+        if ![0, self.configuration.height].contains(&height) {
             self.failure = Some("compositor rejected indicator height".into());
             return;
         }
