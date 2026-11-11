@@ -45,16 +45,12 @@ supported; fractional scales use compositor resampling. There is deliberately no
 config reload, theme discovery, installer, CLI framework, or alternate
 compositor support. Restart the service after changing configuration.
 
-## NixOS integration
+## Desktop setup
 
-`/etc/nixos` pins this local Git repository as a flake input. Commit changes
-here, then run `nix flake update workspace-indicator` in `/etc/nixos` before
-rebuilding. The local input requires this checkout at its current path; use a
-remote Git URL if deploying the configuration to another machine.
-
-The Home Manager module supplies palette colors and timings and attaches the
-service to `hyprland-session.target`. It does not enable the service in an
-already-running session until Home Manager activation.
+This standalone prototype is not enabled in `/etc/nixos`. The desktop uses
+Waybar's native `hyprland/workspaces` module instead, configured in
+`/etc/nixos/modules/home-manager/waybar.nix`, with always-visible markers at the
+top center. No separate OSD process or service is needed.
 
 ## Verification
 
