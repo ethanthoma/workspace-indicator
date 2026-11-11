@@ -1,4 +1,19 @@
-/target/
-/result
-/result-*
-/.direnv/
+*
+!*/
+
+# Repository metadata
+!/.gitignore
+!/README.md
+
+# Rust
+!/Cargo.toml
+!/Cargo.lock
+!/src/**/*.rs
+!/tests/**/*.rs
+
+# Nix
+!/flake.nix
+!/flake.lock
+
+# Application configuration
+!/config.json
