@@ -9,14 +9,51 @@ Based on
 This version is written in Rust and runs as a separate Wayland layer surface,
 not a Waybar module.
 
-## Run
+## Install
 
-Inside a Hyprland session:
+From a checkout, install with Nix:
 
 ```console
-nix build
-./result/bin/workspace-indicator config.json
+nix profile install .
 ```
+
+Or with Cargo and a Rust toolchain that supports edition 2024:
+
+```console
+cargo install --path . --locked
+```
+
+Copy the example configuration to a persistent location:
+
+```console
+mkdir -p ~/.config/workspace-indicator
+cp config.json ~/.config/workspace-indicator/config.json
+```
+
+Run it from a terminal inside Hyprland:
+
+```console
+workspace-indicator ~/.config/workspace-indicator/config.json
+```
+
+## Session startup
+
+Add the command above to your Hyprland session's startup commands, using an
+absolute path to the configuration file. For Hyprland versions using
+`hyprland.conf`, for example:
+
+```ini
+exec-once = workspace-indicator /home/YOUR_USER/.config/workspace-indicator/config.json
+```
+
+Use the equivalent startup command if your Hyprland version uses Lua
+configuration. The executable must be on the compositor's `PATH`; otherwise, use
+its absolute path too. Run only one instance.
+
+The indicator reads `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and
+`HYPRLAND_INSTANCE_SIGNATURE` from the session environment. If you launch it
+through a user service instead, those variables must also be available to the
+service.
 
 ## Configuration
 
