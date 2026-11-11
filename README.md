@@ -47,10 +47,26 @@ compositor support. Restart the service after changing configuration.
 
 ## Desktop setup
 
-This standalone prototype is not enabled in `/etc/nixos`. The desktop uses
-Waybar's native `hyprland/workspaces` module instead, configured in
-`/etc/nixos/modules/home-manager/waybar.nix`, with always-visible markers at the
-top center. No separate OSD process or service is needed.
+`/etc/nixos` pins this local Git repository as the `workspace-indicator` flake
+input. Its Home Manager module supplies palette colors and timings and runs a
+user service tied to `hyprland-session.target`. Waybar's native workspace markers
+remain enabled alongside the OSD.
+
+After committing changes here, update the pin and rebuild:
+
+```console
+cd /etc/nixos
+nix flake update workspace-indicator
+sudo nixos-rebuild switch --flake .#desktop
+```
+
+The local input requires this checkout at its current path. Use a remote Git URL
+when deploying to another machine. If the Hyprland session is already running
+and activation does not start the new service, start it explicitly:
+
+```console
+systemctl --user start workspace-indicator.service
+```
 
 ## Verification
 
