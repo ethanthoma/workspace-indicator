@@ -28,7 +28,6 @@ The one argument is a JSON configuration file:
   "margin_top": 0,
   "height": 30,
   "animation_ms": 320,
-  "background": "#1a1c25",
   "active": "#e0e0e0",
   "occupied": "#8f93a2",
   "empty": "#4b526d",
@@ -38,8 +37,9 @@ The one argument is a JSON configuration file:
 
 `height` should match Waybar's height. `margin_top` is the distance from the
 physical output's top edge in logical pixels; the indicator ignores Waybar's
-exclusive zone so both occupy the same row. The background forms a rounded pill
-with three pixels of vertical inset. The surface follows the focused monitor.
+exclusive zone so both occupy the same row. Only the workspace dots and animated
+capsule are drawn; the surrounding surface is transparent. The surface follows
+the focused monitor.
 
 Slots are fixed, numbered 1 through `slots` (1–32). Occupancy is global across
 monitors, matching Hyprland's workspace IDs. Special/named workspaces are not

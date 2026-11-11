@@ -9,7 +9,6 @@ pub struct Config {
     pub margin_top: i32,
     pub height: u32,
     pub slots: u32,
-    pub background: String,
     pub active: String,
     pub occupied: String,
     pub empty: String,
@@ -42,13 +41,7 @@ impl Config {
         if !(0..=1000).contains(&self.margin_top) {
             return Err("margin_top must be between 0 and 1000".into());
         }
-        for color in [
-            &self.background,
-            &self.active,
-            &self.occupied,
-            &self.empty,
-            &self.urgent,
-        ] {
+        for color in [&self.active, &self.occupied, &self.empty, &self.urgent] {
             parse_color(color)?;
         }
         Ok(())
@@ -155,7 +148,6 @@ pub fn render(
     snapshot: &Snapshot,
 ) {
     let colors = [
-        &config.background,
         &config.active,
         &config.occupied,
         &config.empty,
@@ -164,23 +156,12 @@ pub fn render(
     .map(|color| parse_color(color).expect("validated color"));
     let width = config.width() * scale;
     assert_eq!(canvas.len(), (width * config.height * scale * 4) as usize);
-    let radius = config.height as f32 * 0.5 - 3.0;
     for (index, pixel) in canvas.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = (index as u32 % width) as f32 / scale as f32 + 0.5 / scale as f32;
         let y = (index as u32 / width) as f32 / scale as f32 + 0.5 / scale as f32
             - config.height as f32 * 0.5;
-        let background = coverage(
-            x,
-            y,
-            Capsule {
-                left: radius + 3.0,
-                right: config.width() as f32 - radius - 3.0,
-            },
-            radius,
-            scale,
-        );
-        let mut alpha = background * 0.94;
-        let mut premultiplied = colors[0].map(|channel| channel as f32 / 255.0 * alpha);
+        let mut alpha = 0.0;
+        let mut premultiplied = [0.0; 3];
         let mut composite = |color: [u8; 3], coverage: f32| {
             for channel in 0..3 {
                 premultiplied[channel] = color[channel] as f32 / 255.0 * coverage
@@ -201,16 +182,16 @@ pub fn render(
                 scale,
             );
             let color = if snapshot.urgent[slot as usize] {
-                4
-            } else if snapshot.occupied[slot as usize] {
-                2
-            } else {
                 3
+            } else if snapshot.occupied[slot as usize] {
+                1
+            } else {
+                2
             };
             composite(colors[color], dot);
         }
         if let Some(capsule) = capsule {
-            composite(colors[1], coverage(x, y, capsule, 5.0, scale));
+            composite(colors[0], coverage(x, y, capsule, 5.0, scale));
         }
         let argb = ((alpha * 255.0).round() as u32) << 24
             | ((premultiplied[0] * 255.0).round() as u32) << 16
@@ -229,7 +210,6 @@ mod tests {
             animation_ms: 320,
             height: 30,
             margin_top: 0,
-            background: "#0f111a".into(),
             active: "#e0e0e0".into(),
             occupied: "#8f93a2".into(),
             empty: "#4b526d".into(),
@@ -361,6 +341,36 @@ mod tests {
         assert_ne!(pixel(&canvas, 26), active);
         assert_ne!(pixel(&canvas, 66), active);
         assert_eq!(pixel(&canvas, 106), active);
+    }
+
+    #[test]
+    fn surrounding_pixels_and_gaps_are_transparent() {
+        let config = config();
+        let snapshot = Snapshot {
+            monitor: "DP-2".into(),
+            active: 1,
+            occupied: [true; 32],
+            urgent: [false; 32],
+        };
+        let capsule = Capsule {
+            left: 26.0,
+            right: 26.0,
+        };
+        // Reused buffers must be cleared, not just left untouched outside the dots.
+        let mut canvas = vec![255; (config.width() * config.height * 4) as usize];
+        render(&mut canvas, 1, Some(capsule), &config, &snapshot);
+        for (index, pixel) in canvas.as_chunks::<4>().0.iter().enumerate() {
+            let x = index as u32 % config.width();
+            let y = index as u32 / config.width();
+            if (y as f32 + 0.5 - config.height as f32 * 0.5).abs() > 5.5 {
+                assert_eq!(*pixel, [0; 4]);
+            }
+            if x == 36 {
+                assert_eq!(*pixel, [0; 4]);
+            }
+        }
+        let center = ((config.height / 2 * config.width() + 26) * 4) as usize;
+        assert_eq!(canvas[center + 3], 255);
     }
 
     #[test]

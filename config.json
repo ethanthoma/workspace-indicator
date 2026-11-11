@@ -3,7 +3,6 @@
   "margin_top": 0,
   "height": 30,
   "animation_ms": 320,
-  "background": "#1a1c25",
   "active": "#e0e0e0",
   "occupied": "#8f93a2",
   "empty": "#4b526d",
