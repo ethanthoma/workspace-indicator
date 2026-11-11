@@ -1,27 +1,31 @@
 use crate::Result;
 use serde::Deserialize;
-use std::{ffi::OsStr, time::Duration};
+use std::{ffi::OsStr, io::Read, time::Duration};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub display_ms: u64,
-    pub fade_ms: u64,
-    pub margin: i32,
+    pub animation_ms: u64,
+    pub margin_top: i32,
+    pub height: u32,
     pub slots: u32,
     pub background: String,
     pub active: String,
     pub occupied: String,
     pub empty: String,
+    pub urgent: String,
 }
 
 impl Config {
     pub fn load(path: &OsStr) -> Result<Self> {
-        let metadata = std::fs::metadata(path)?;
-        if metadata.len() > 4096 {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(4097)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 {
             return Err("configuration exceeds 4096 bytes".into());
         }
-        let config: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        let config: Self = serde_json::from_slice(&bytes)?;
         config.validate()?;
         Ok(config)
     }
@@ -29,22 +33,33 @@ impl Config {
         if !(1..=32).contains(&self.slots) {
             return Err("slots must be between 1 and 32".into());
         }
-        if !(1..=10000).contains(&self.display_ms) {
-            return Err("display_ms must be between 1 and 10000".into());
+        if !(1..=2000).contains(&self.animation_ms) {
+            return Err("animation_ms must be between 1 and 2000".into());
         }
-        if !(1..=2000).contains(&self.fade_ms) {
-            return Err("fade_ms must be between 1 and 2000".into());
+        if !(24..=64).contains(&self.height) {
+            return Err("height must be between 24 and 64".into());
         }
-        if !(0..=1000).contains(&self.margin) {
-            return Err("margin must be between 0 and 1000".into());
+        if !(0..=1000).contains(&self.margin_top) {
+            return Err("margin_top must be between 0 and 1000".into());
         }
-        for color in [&self.background, &self.active, &self.occupied, &self.empty] {
+        for color in [
+            &self.background,
+            &self.active,
+            &self.occupied,
+            &self.empty,
+            &self.urgent,
+        ] {
             parse_color(color)?;
         }
         Ok(())
     }
     pub fn width(&self) -> u32 {
         32 + self.slots * 20
+    }
+    pub fn active_center(&self, workspace: i32) -> Option<f32> {
+        (1..=self.slots as i32)
+            .contains(&workspace)
+            .then(|| 26.0 + (workspace - 1) as f32 * 20.0)
     }
 }
 
@@ -53,17 +68,68 @@ pub struct Snapshot {
     pub monitor: String,
     pub active: i32,
     pub occupied: [bool; 32],
-}
-impl Snapshot {
-    pub fn focus(&self) -> (&str, i32) {
-        (&self.monitor, self.active)
-    }
+    pub urgent: [bool; 32],
 }
 
-pub fn opacity(elapsed: Duration, config: &Config) -> f32 {
-    let fade_elapsed = elapsed.saturating_sub(Duration::from_millis(config.display_ms));
-    (1.0 - fade_elapsed.as_secs_f32() / Duration::from_millis(config.fade_ms).as_secs_f32())
-        .clamp(0.0, 1.0)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Capsule {
+    pub left: f32,
+    pub right: f32,
+}
+
+pub struct Motion {
+    from: Capsule,
+    target: f32,
+    started: Duration,
+    duration: Duration,
+}
+
+impl Motion {
+    pub fn new(target: f32, duration: Duration) -> Self {
+        Self {
+            from: Capsule {
+                left: target,
+                right: target,
+            },
+            target,
+            started: Duration::ZERO,
+            duration,
+        }
+    }
+    pub fn retarget(&mut self, target: f32, now: Duration) {
+        if self.target == target {
+            return;
+        }
+        self.from = self.sample(now);
+        self.target = target;
+        self.started = now;
+    }
+    pub fn running(&self, now: Duration) -> bool {
+        if now.saturating_sub(self.started) >= self.duration {
+            return false;
+        }
+        self.from
+            != Capsule {
+                left: self.target,
+                right: self.target,
+            }
+    }
+    pub fn sample(&self, now: Duration) -> Capsule {
+        let progress = (now.saturating_sub(self.started).as_secs_f32()
+            / self.duration.as_secs_f32())
+        .clamp(0.0, 1.0);
+        let leading = 1.0 - (1.0 - progress).powi(3);
+        let trailing = progress.powi(3);
+        let moving_right = self.target >= (self.from.left + self.from.right) * 0.5;
+        let left_progress = if moving_right { trailing } else { leading };
+        let right_progress = if moving_right { leading } else { trailing };
+        let left = self.from.left + (self.target - self.from.left) * left_progress;
+        let right = self.from.right + (self.target - self.from.right) * right_progress;
+        Capsule {
+            left: left.min(right),
+            right: left.max(right),
+        }
+    }
 }
 
 fn parse_color(value: &str) -> Result<[u8; 3]> {
@@ -75,51 +141,81 @@ fn parse_color(value: &str) -> Result<[u8; 3]> {
     Ok([(number >> 16) as u8, (number >> 8) as u8, number as u8])
 }
 
-pub fn render(canvas: &mut [u8], scale: u32, opacity: f32, config: &Config, snapshot: &Snapshot) {
+fn coverage(x: f32, y: f32, capsule: Capsule, radius: f32, scale: u32) -> f32 {
+    let center_x = x.clamp(capsule.left, capsule.right);
+    let distance = ((x - center_x).powi(2) + y.powi(2)).sqrt() - radius;
+    (0.5 - distance * scale as f32).clamp(0.0, 1.0)
+}
+
+pub fn render(
+    canvas: &mut [u8],
+    scale: u32,
+    capsule: Option<Capsule>,
+    config: &Config,
+    snapshot: &Snapshot,
+) {
     let colors = [
         &config.background,
         &config.active,
         &config.occupied,
         &config.empty,
+        &config.urgent,
     ]
     .map(|color| parse_color(color).expect("validated color"));
     let width = config.width() * scale;
-    assert_eq!(canvas.len(), (width * 40 * scale * 4) as usize);
+    assert_eq!(canvas.len(), (width * config.height * scale * 4) as usize);
+    let radius = config.height as f32 * 0.5 - 3.0;
     for (index, pixel) in canvas.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = (index as u32 % width) as f32 / scale as f32 + 0.5 / scale as f32;
-        let y = (index as u32 / width) as f32 / scale as f32 + 0.5 / scale as f32;
-        let center_x = x.clamp(20.0, config.width() as f32 - 20.0);
-        let distance = ((x - center_x).powi(2) + (y - 20.0).powi(2)).sqrt() - 19.0;
-        let coverage = (0.5 - distance * scale as f32).clamp(0.0, 1.0);
-        let mut color = colors[0];
-        let mut alpha = coverage * 0.94;
-        for slot in 0..config.slots {
-            let active = snapshot.active == (slot + 1) as i32;
-            let radius = if active { 5.0 } else { 3.5 };
-            let distance =
-                ((x - (26 + slot * 20) as f32).powi(2) + (y - 20.0).powi(2)).sqrt() - radius;
-            let dot = (0.5 - distance * scale as f32).clamp(0.0, 1.0);
-            if dot > 0.0 {
-                let foreground = colors[if active {
-                    1
-                } else if snapshot.occupied[slot as usize] {
-                    2
-                } else {
-                    3
-                }];
-                for channel in 0..3 {
-                    color[channel] = (color[channel] as f32 * (1.0 - dot)
-                        + foreground[channel] as f32 * dot)
-                        as u8;
-                }
-                alpha += (1.0 - alpha) * dot;
+        let y = (index as u32 / width) as f32 / scale as f32 + 0.5 / scale as f32
+            - config.height as f32 * 0.5;
+        let background = coverage(
+            x,
+            y,
+            Capsule {
+                left: radius + 3.0,
+                right: config.width() as f32 - radius - 3.0,
+            },
+            radius,
+            scale,
+        );
+        let mut alpha = background * 0.94;
+        let mut premultiplied = colors[0].map(|channel| channel as f32 / 255.0 * alpha);
+        let mut composite = |color: [u8; 3], coverage: f32| {
+            for channel in 0..3 {
+                premultiplied[channel] = color[channel] as f32 / 255.0 * coverage
+                    + premultiplied[channel] * (1.0 - coverage);
             }
+            alpha = coverage + alpha * (1.0 - coverage);
+        };
+        for slot in 0..config.slots {
+            let center = 26.0 + slot as f32 * 20.0;
+            let dot = coverage(
+                x,
+                y,
+                Capsule {
+                    left: center,
+                    right: center,
+                },
+                3.5,
+                scale,
+            );
+            let color = if snapshot.urgent[slot as usize] {
+                4
+            } else if snapshot.occupied[slot as usize] {
+                2
+            } else {
+                3
+            };
+            composite(colors[color], dot);
         }
-        alpha *= opacity;
+        if let Some(capsule) = capsule {
+            composite(colors[1], coverage(x, y, capsule, 5.0, scale));
+        }
         let argb = ((alpha * 255.0).round() as u32) << 24
-            | ((color[0] as f32 * alpha).round() as u32) << 16
-            | ((color[1] as f32 * alpha).round() as u32) << 8
-            | (color[2] as f32 * alpha).round() as u32;
+            | ((premultiplied[0] * 255.0).round() as u32) << 16
+            | ((premultiplied[1] * 255.0).round() as u32) << 8
+            | (premultiplied[2] * 255.0).round() as u32;
         pixel.copy_from_slice(&argb.to_ne_bytes());
     }
 }
@@ -130,30 +226,61 @@ mod tests {
     fn config() -> Config {
         Config {
             slots: 5,
-            display_ms: 900,
-            fade_ms: 200,
-            margin: 60,
-            background: "#191724".into(),
-            active: "#c4a7e7".into(),
-            occupied: "#e0def4".into(),
-            empty: "#524f67".into(),
+            animation_ms: 320,
+            height: 30,
+            margin_top: 0,
+            background: "#0f111a".into(),
+            active: "#e0e0e0".into(),
+            occupied: "#8f93a2".into(),
+            empty: "#4b526d".into(),
+            urgent: "#f2283c".into(),
         }
     }
     #[test]
-    fn fade_is_bounded_monotonic_and_expires() {
-        let config = config();
-        let mut previous = 1.0;
-        for milliseconds in 0..=2000 {
-            let alpha = opacity(Duration::from_millis(milliseconds), &config);
-            assert!((0.0..=previous).contains(&alpha));
-            if milliseconds <= config.display_ms {
-                assert_eq!(alpha, 1.0);
+    fn motion_stretches_settles_and_remains_bounded_in_both_directions() {
+        for source in 0..32 {
+            for target in 0..32 {
+                let source = 26.0 + source as f32 * 20.0;
+                let target = 26.0 + target as f32 * 20.0;
+                let mut motion = Motion::new(source, Duration::from_millis(320));
+                motion.retarget(target, Duration::ZERO);
+                for milliseconds in 0..=400 {
+                    let shape = motion.sample(Duration::from_millis(milliseconds));
+                    assert!(shape.left >= source.min(target));
+                    assert!(shape.left <= shape.right);
+                    assert!(shape.right <= source.max(target));
+                    if milliseconds >= 320 {
+                        assert_eq!(
+                            shape,
+                            Capsule {
+                                left: target,
+                                right: target
+                            }
+                        );
+                    }
+                }
+                let mid = motion.sample(Duration::from_millis(160));
+                assert!((mid.right - mid.left - (target - source).abs() * 0.75).abs() < 0.001);
+                assert!(!motion.running(Duration::from_millis(320)));
             }
-            if milliseconds >= config.display_ms + config.fade_ms {
-                assert_eq!(alpha, 0.0);
-            }
-            previous = alpha;
         }
+    }
+    #[test]
+    fn retargeting_preserves_geometry_even_on_rapid_reversal() {
+        let mut motion = Motion::new(26.0, Duration::from_millis(320));
+        let mut seed = 42_u32;
+        for milliseconds in (0..10000).step_by(17) {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let now = Duration::from_millis(milliseconds);
+            let before = motion.sample(now);
+            motion.retarget(26.0 + (seed % 32) as f32 * 20.0, now);
+            assert_eq!(motion.sample(now), before);
+            let after = motion.sample(now + Duration::from_millis(16));
+            assert!(after.left >= 26.0);
+            assert!(after.left <= after.right);
+            assert!(after.right <= 646.0);
+        }
+        assert!(!motion.running(Duration::from_secs(20)));
     }
     #[test]
     fn rendered_pixels_are_premultiplied_at_every_supported_size_and_scale() {
@@ -161,31 +288,87 @@ mod tests {
         for slots in 1..=32 {
             config.slots = slots;
             for scale in 1..=4 {
-                let mut canvas = vec![0; (config.width() * 40 * scale * scale * 4) as usize];
+                let mut canvas =
+                    vec![0; (config.width() * config.height * scale * scale * 4) as usize];
                 let snapshot = Snapshot {
                     monitor: "DP-2".into(),
                     active: slots as i32,
                     occupied: [true; 32],
+                    urgent: [false; 32],
                 };
-                for alpha in [0.0, 0.5, 1.0] {
-                    render(&mut canvas, scale, alpha, &config, &snapshot);
+                let mut motion = Motion::new(26.0, Duration::from_millis(320));
+                motion.retarget(config.active_center(slots as i32).unwrap(), Duration::ZERO);
+                for milliseconds in [0, 160, 320] {
+                    render(
+                        &mut canvas,
+                        scale,
+                        Some(motion.sample(Duration::from_millis(milliseconds))),
+                        &config,
+                        &snapshot,
+                    );
                     for pixel in canvas.as_chunks::<4>().0 {
                         let argb = u32::from_ne_bytes(*pixel);
-                        let alpha_byte = argb >> 24;
                         for shift in [0, 8, 16] {
-                            assert!((argb >> shift) & 255 <= alpha_byte);
-                        }
-                        if alpha == 0.0 {
-                            assert_eq!(argb, 0);
+                            assert!((argb >> shift) & 255 <= argb >> 24);
                         }
                     }
+                    assert_eq!(u32::from_ne_bytes(canvas[..4].try_into().unwrap()), 0);
                 }
             }
         }
     }
     #[test]
+    fn rendered_capsule_moves_through_intermediate_pixels_and_settles() {
+        let config = config();
+        let snapshot = Snapshot {
+            monitor: "DP-2".into(),
+            active: 5,
+            occupied: [true; 32],
+            urgent: [false; 32],
+        };
+        let mut canvas = vec![0; (config.width() * config.height * 4) as usize];
+        let mut motion = Motion::new(26.0, Duration::from_millis(320));
+        motion.retarget(106.0, Duration::ZERO);
+        let active = 0xffe0e0e0;
+        let pixel = |canvas: &[u8], x: u32| {
+            let offset = ((config.height / 2 * config.width() + x) * 4) as usize;
+            u32::from_ne_bytes(canvas[offset..offset + 4].try_into().unwrap())
+        };
+        render(
+            &mut canvas,
+            1,
+            Some(motion.sample(Duration::ZERO)),
+            &config,
+            &snapshot,
+        );
+        assert_eq!(pixel(&canvas, 26), active);
+        assert_ne!(pixel(&canvas, 106), active);
+        render(
+            &mut canvas,
+            1,
+            Some(motion.sample(Duration::from_millis(160))),
+            &config,
+            &snapshot,
+        );
+        assert_eq!(pixel(&canvas, 66), active);
+        render(
+            &mut canvas,
+            1,
+            Some(motion.sample(Duration::from_millis(320))),
+            &config,
+            &snapshot,
+        );
+        assert_ne!(pixel(&canvas, 26), active);
+        assert_ne!(pixel(&canvas, 66), active);
+        assert_eq!(pixel(&canvas, 106), active);
+    }
+
+    #[test]
     fn rejects_invalid_configuration() {
         let mut config = config();
+        config.validate().unwrap();
+        assert_eq!(config.active_center(0), None);
+        assert_eq!(config.active_center(6), None);
         config.slots = 0;
         assert!(config.validate().is_err());
         for color in ["", "ffffff", "#12345", "#gggggg", "#éabcd"] {

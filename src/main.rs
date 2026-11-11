@@ -1,9 +1,9 @@
 mod hyprland;
 mod model;
 
-use model::{Config, Snapshot};
+use model::{Config, Motion, Snapshot};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
     output::{OutputHandler, OutputState},
     reexports::{
@@ -35,6 +35,7 @@ use wayland_client::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+const POOL_BYTES: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().collect();
@@ -48,7 +49,7 @@ fn main() -> Result<()> {
     let compositor = CompositorState::bind(&globals, &handle)?;
     let shell = LayerShell::bind(&globals, &handle)?;
     let shm = Shm::bind(&globals, &handle)?;
-    let pool = SlotPool::new(1024 * 1024, &shm)?;
+    let pool = SlotPool::new(POOL_BYTES, &shm)?;
     let mut app = App {
         registry: RegistryState::new(&globals),
         outputs: OutputState::new(&globals, &handle),
@@ -59,6 +60,8 @@ fn main() -> Result<()> {
         config,
         snapshot: None,
         visible: None,
+        epoch: Instant::now(),
+        motion: None,
         failure: None,
         exit: false,
     };
@@ -70,21 +73,25 @@ fn main() -> Result<()> {
         .handle()
         .insert_source(receiver, move |event, _, app| match event {
             channel::Event::Msg(Ok(snapshot)) => {
-                let changed = app
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|previous| previous.focus() != snapshot.focus());
-                app.snapshot = Some(snapshot);
-                if changed {
-                    app.failure = app.show(&event_handle).err().map(|error| error.to_string());
+                let center = app.config.active_center(snapshot.active);
+                let now = app.epoch.elapsed();
+                match center {
+                    Some(center) => match &mut app.motion {
+                        Some(motion) => motion.retarget(center, now),
+                        None => {
+                            app.motion = Some(Motion::new(
+                                center,
+                                Duration::from_millis(app.config.animation_ms),
+                            ))
+                        }
+                    },
+                    None => app.motion = None,
                 }
+                app.snapshot = Some(snapshot);
+                app.refresh(&event_handle);
             }
-            channel::Event::Msg(Err(error)) => {
-                app.failure = Some(error);
-            }
-            channel::Event::Closed => {
-                app.exit = true;
-            }
+            channel::Event::Msg(Err(error)) => app.failure = Some(error),
+            channel::Event::Closed => app.exit = true,
         })
         .map_err(|error| error.to_string())?;
     std::thread::Builder::new()
@@ -98,21 +105,12 @@ fn main() -> Result<()> {
         if let Some(error) = app.failure.take() {
             return Err(error.into());
         }
-        let timeout = app.visible.as_ref().map(|visible| {
-            let elapsed = visible.started.elapsed();
-            let hold = Duration::from_millis(app.config.display_ms);
-            if elapsed < hold {
-                hold - elapsed
-            } else {
-                Duration::from_millis(16)
-            }
-        });
-        event_loop.dispatch(timeout, &mut app)?;
-        app.draw()?;
+        event_loop.dispatch(None, &mut app)?;
+        if let Some(error) = app.failure.take() {
+            return Err(error.into());
+        }
+        app.draw(&handle)?;
         connection.flush()?;
-    }
-    if let Some(error) = app.failure {
-        return Err(error.into());
     }
     Ok(())
 }
@@ -127,21 +125,33 @@ struct App {
     config: Config,
     snapshot: Option<Snapshot>,
     visible: Option<Visible>,
+    epoch: Instant,
+    motion: Option<Motion>,
     failure: Option<String>,
     exit: bool,
 }
 
 struct Visible {
     layer: LayerSurface,
-    started: Instant,
+    output: wl_output::WlOutput,
     configured: bool,
     scale: i32,
     buffers: Vec<Buffer>,
+    dirty: bool,
+    frame_pending: bool,
 }
 
 impl App {
-    fn show(&mut self, handle: &QueueHandle<Self>) -> Result<()> {
-        self.visible = None;
+    fn refresh(&mut self, handle: &QueueHandle<Self>) {
+        if let Err(error) = self.refresh_surface(handle) {
+            self.failure = Some(error.to_string());
+        }
+        if let Some(visible) = &mut self.visible {
+            visible.dirty = true;
+        }
+    }
+
+    fn refresh_surface(&mut self, handle: &QueueHandle<Self>) -> Result<()> {
         let Some(snapshot) = &self.snapshot else {
             return Ok(());
         };
@@ -151,15 +161,26 @@ impl App {
                 .is_some_and(|info| info.name.as_deref() == Some(&snapshot.monitor))
         });
         let Some(output) = output else {
+            self.visible = None;
             return Ok(());
         };
+        if self
+            .visible
+            .as_ref()
+            .is_some_and(|visible| visible.output == output)
+        {
+            return Ok(());
+        }
+        self.visible = None;
         let scale = self
             .outputs
             .info(&output)
-            .map_or(1, |info| info.scale_factor)
-            .clamp(1, 4);
+            .map_or(1, |info| info.scale_factor);
+        if !(1..=4).contains(&scale) {
+            return Err("output scale must be between 1 and 4".into());
+        }
         let surface = self.compositor.create_surface(handle);
-        let region = smithay_client_toolkit::compositor::Region::new(&self.compositor)?;
+        let region = Region::new(&self.compositor)?;
         surface.set_input_region(Some(region.wl_region()));
         let layer = self.shell.create_layer_surface(
             handle,
@@ -168,36 +189,40 @@ impl App {
             Some("workspace-indicator"),
             Some(&output),
         );
-        layer.set_anchor(Anchor::BOTTOM);
-        layer.set_margin(0, 0, self.config.margin, 0);
+        layer.set_anchor(Anchor::TOP);
+        layer.set_margin(self.config.margin_top, 0, 0, 0);
+        // Ignore Waybar's exclusive zone: the overlay shares its row, not the desktop below it.
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_size(self.config.width(), 40);
+        layer.set_size(self.config.width(), self.config.height);
         layer.commit();
         self.visible = Some(Visible {
             layer,
-            started: Instant::now(),
+            output,
             configured: false,
             scale,
             buffers: Vec::with_capacity(2),
+            dirty: true,
+            frame_pending: false,
         });
         Ok(())
     }
 
-    fn draw(&mut self) -> Result<()> {
+    fn draw(&mut self, handle: &QueueHandle<Self>) -> Result<()> {
         let Some(visible) = &mut self.visible else {
             return Ok(());
         };
-        let opacity = model::opacity(visible.started.elapsed(), &self.config);
-        if opacity == 0.0 {
-            self.visible = None;
-            return Ok(());
-        }
         if !visible.configured {
             return Ok(());
         }
+        if !visible.dirty {
+            return Ok(());
+        }
+        if visible.frame_pending {
+            return Ok(());
+        }
         let width = self.config.width() as i32 * visible.scale;
-        let height = 40 * visible.scale;
+        let height = self.config.height as i32 * visible.scale;
         let index = visible
             .buffers
             .iter()
@@ -208,6 +233,10 @@ impl App {
                 let (buffer, _) =
                     self.pool
                         .create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)?;
+                // Fail rather than allow growth under pathological buffer-release delays.
+                if self.pool.len() > POOL_BYTES {
+                    return Err("render buffer pool exhausted".into());
+                }
                 visible.buffers.push(buffer);
                 visible.buffers.len() - 1
             }
@@ -221,10 +250,11 @@ impl App {
             .snapshot
             .as_ref()
             .expect("visible surface has a snapshot");
+        let now = self.epoch.elapsed();
         model::render(
             canvas,
             visible.scale as u32,
-            opacity,
+            self.motion.as_ref().map(|motion| motion.sample(now)),
             &self.config,
             snapshot,
         );
@@ -232,6 +262,15 @@ impl App {
         surface.set_buffer_scale(visible.scale);
         surface.damage_buffer(0, 0, width, height);
         buffer.attach_to(surface)?;
+        if self
+            .motion
+            .as_ref()
+            .is_some_and(|motion| motion.running(now))
+        {
+            surface.frame(handle, surface.clone());
+            visible.frame_pending = true;
+        }
+        visible.dirty = false;
         visible.layer.commit();
         Ok(())
     }
@@ -242,12 +281,24 @@ impl CompositorHandler for App {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         factor: i32,
     ) {
-        if let Some(visible) = &mut self.visible {
-            visible.scale = factor.clamp(1, 4);
+        let Some(visible) = self
+            .visible
+            .as_mut()
+            .filter(|visible| visible.layer.wl_surface() == surface)
+        else {
+            return;
+        };
+        if !(1..=4).contains(&factor) {
+            self.failure = Some("output scale must be between 1 and 4".into());
+            return;
+        }
+        if visible.scale != factor {
+            visible.scale = factor;
             visible.buffers.clear();
+            visible.dirty = true;
         }
     }
     fn transform_changed(
@@ -258,7 +309,22 @@ impl CompositorHandler for App {
         _: wl_output::Transform,
     ) {
     }
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if let Some(visible) = self
+            .visible
+            .as_mut()
+            .filter(|visible| visible.layer.wl_surface() == surface)
+        {
+            visible.frame_pending = false;
+            visible.dirty = true;
+        }
+    }
     fn surface_enter(
         &mut self,
         _: &Connection,
@@ -280,10 +346,30 @@ impl OutputHandler for App {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.outputs
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
-        self.visible = None;
+    fn new_output(&mut self, _: &Connection, handle: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.refresh(handle);
+    }
+    fn update_output(
+        &mut self,
+        _: &Connection,
+        handle: &QueueHandle<Self>,
+        _: wl_output::WlOutput,
+    ) {
+        self.refresh(handle);
+    }
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        if self
+            .visible
+            .as_ref()
+            .is_some_and(|visible| visible.output == output)
+        {
+            self.visible = None;
+        }
     }
 }
 impl LayerShellHandler for App {
@@ -301,16 +387,27 @@ impl LayerShellHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         layer: &LayerSurface,
-        _: LayerSurfaceConfigure,
+        configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        if let Some(visible) = self
+        let Some(visible) = self
             .visible
             .as_mut()
             .filter(|visible| &visible.layer == layer)
-        {
-            visible.configured = true;
+        else {
+            return;
+        };
+        let (width, height) = configure.new_size;
+        if width != 0 && width != self.config.width() {
+            self.failure = Some("compositor rejected indicator width".into());
+            return;
         }
+        if height != 0 && height != self.config.height {
+            self.failure = Some("compositor rejected indicator height".into());
+            return;
+        }
+        visible.configured = true;
+        visible.dirty = true;
     }
 }
 impl ShmHandler for App {
