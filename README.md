@@ -4,6 +4,8 @@ A Hyprland-only workspace OSD in Rust. Shows a click-through pill on the focused
 monitor when the active workspace or focused monitor changes, then fades away.
 It does not modify Hyprland configuration or keybindings.
 
+Based on [ZanzyTHEbar/workspace-indicator](https://github.com/ZanzyTHEbar/workspace-indicator).
+
 Uses Smithay's client toolkit for Wayland layer-shell and shared-memory buffers.
 The Hyprland event socket drives updates; there is no polling while hidden.
 Keyboard input is disabled and the input region is empty. The overlay reserves
