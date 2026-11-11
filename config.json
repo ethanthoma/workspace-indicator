@@ -1,0 +1,10 @@
+{
+    "slots": 5,
+    "margin": 60,
+    "display_ms": 900,
+    "fade_ms": 200,
+    "background": "#0f111a",
+    "active": "#875afb",
+    "occupied": "#e0e0e0",
+    "empty": "#4b526d"
+}
